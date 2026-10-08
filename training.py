@@ -80,7 +80,15 @@ OBS_FIELDS = [
 ]
 OBS_TIME = "obs_weather_time"
 OBS_ARGS = OBS_FIELDS + [OBS_TIME]
-OBS_SHIFTS_H = (-2, -1, 0, 1, 2)
+
+# Run 4 (experiment fuuuqazsves2j4ir7d6re43kny) read weather_time as UTC and
+# found the error falling monotonically to the edge of the -2..+2 h search
+# (best +2 h in an August holdout), which is what local German summer time read
+# as UTC looks like. weather_time is therefore read as Europe/Berlin local time
+# when it carries no offset, and the only shift left to search is the hour
+# labelling convention: 0 = labelled by its start, 1 = labelled by its end.
+OBS_TIMEZONE = os.environ.get("PV_OBS_TIMEZONE", "Europe/Berlin")
+OBS_SHIFTS_H = (0, 1)
 
 HOUR = pd.Timedelta(hours=1)
 
@@ -154,6 +162,24 @@ FEATURE_COLUMNS = FORECAST_FIELDS + NEXT_FIELDS + GEOMETRY_COLUMNS + [
 
 def _parse_utc(values) -> pd.Series:
     return pd.to_datetime(pd.Series(values), utc=True, errors="coerce")
+
+
+def _parse_local_to_utc(values, zone: str) -> typing.Tuple[pd.Series, bool]:
+    """Timestamps without an offset read as local time in `zone`, then UTC.
+
+    Returns the parsed series and whether localisation was applied. A timestamp
+    that already carries an offset is converted as it stands. The hour that
+    repeats at the end of summer time and the hour skipped at its start cannot be
+    placed and become NaT rather than being guessed.
+    """
+    raw = pd.to_datetime(pd.Series(values), errors="coerce")
+    if pd.api.types.is_datetime64tz_dtype(raw):
+        return raw.dt.tz_convert("UTC"), False
+    if not pd.api.types.is_datetime64_any_dtype(raw):
+        # Mixed offsets come back as objects; parse them as the instants they name.
+        return _parse_utc(values), False
+    local = raw.dt.tz_localize(zone, ambiguous="NaT", nonexistent="NaT")
+    return local.dt.tz_convert("UTC"), True
 
 
 # --------------------------------------------------------------------------- #
@@ -283,19 +309,25 @@ def _observed_ceiling(observed: pd.DataFrame, target: pd.Series, holdout_index: 
                       cut) -> typing.Dict[str, float]:
     """The same model on the weather as it turned out, on exactly the same holdout hours.
 
-    weather_time's zone and hour-labelling are not declared by the import, so the
-    clock is aligned by trying OBS_SHIFTS_H and keeping the best — only a time
-    alignment is searched, never a feature, so it stays a fair bound.
+    weather_time is read as OBS_TIMEZONE local time when it carries no offset;
+    only the hour-labelling convention (OBS_SHIFTS_H) is then searched — a time
+    alignment, never a feature, so it stays a fair bound.
     """
     frame = observed.copy()
-    frame["hour"] = _parse_utc(frame[OBS_TIME]).to_numpy()
+    hours, localized = _parse_local_to_utc(frame[OBS_TIME], OBS_TIMEZONE)
+    frame["hour"] = hours.to_numpy()
+    unparsed = float(frame["hour"].isna().mean()) if len(frame) else float("nan")
     frame = frame.dropna(subset=["hour"])
     if "time" in frame.columns:
         frame = frame.sort_values("time", kind="stable")
     frame = frame.drop_duplicates(subset=["hour"], keep="last")
     by_hour = frame.set_index("hour")[OBS_FIELDS].apply(pd.to_numeric, errors="coerce").sort_index()
 
-    report: typing.Dict[str, float] = {"observed_hours": float(len(by_hour))}
+    report: typing.Dict[str, float] = {
+        "observed_hours": float(len(by_hour)),
+        "observed_time_localized": 1.0 if localized else 0.0,
+        "observed_time_unparsed_ratio": unparsed,
+    }
     best = None
     for shift in OBS_SHIFTS_H:
         shifted = by_hour.copy()
@@ -379,6 +411,7 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         "train_to": report["train_to"],
         "lat": LAT,
         "lon": LON,
+        "observed_timezone": OBS_TIMEZONE,
         **{f"hp.{key}": value for key, value in HYPERPARAMS.items()},
     })
     logger.log_metrics({
