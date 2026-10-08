@@ -1,10 +1,13 @@
 """The operator: a day-ahead PV forecast from archived weather forecasts.
 
-Two inputs reach infer():
+Inputs that reach infer():
   * "pv": the PV series itself. It is an input so the model can train on it and
     so the evaluation can score against it; infer() answers nothing for it.
   * "forecast": the Open-Meteo previous-runs archive. Every message is one
     forecast hour at one lead time, published at its issue time.
+  * "history" (diagnostic, training only): the Open-Meteo weather history. It
+    feeds holdout_mae_observed_weather in training and infer() ignores it; it
+    can be dropped from the pipeline once that question is answered.
 
 The model predicts hour B from the forecasts for B and B + 1h at the trained lead
 time. The forecast for B + 1h is issued an hour after the one for B, so infer()
@@ -22,7 +25,7 @@ from mlflow.pyfunc import PyFuncModel, PythonModel
 from operator_lib.util import Config, MLOperator, Selector
 from operator_lib.util.helpers import TrainMlflowLogger
 
-from training import FORECAST_ARGS, FORECAST_FIELDS, LEAD_DAYS, PV_ARG, train_model
+from training import FORECAST_ARGS, FORECAST_FIELDS, LEAD_DAYS, OBS_ARGS, PV_ARG, train_model
 
 HOUR = datetime.timedelta(hours=1)
 
@@ -54,6 +57,7 @@ class Operator(MLOperator):
     selectors = [
         Selector({"name": "pv", "args": [PV_ARG]}),
         Selector({"name": "forecast", "args": FORECAST_ARGS}),
+        Selector({"name": "history", "args": OBS_ARGS}),
     ]
 
     def init(self, *args, **kwargs):

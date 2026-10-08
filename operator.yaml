@@ -13,8 +13,10 @@ pub: false
 deploymentType: local
 
 # What the pipeline editor offers as inputs. Each name has to match a selector
-# arg in op.py; the two selectors are "pv" (the PV series) and "forecast" (the
-# Open-Meteo previous-runs archive, all eight fields from one import).
+# arg in op.py; the selectors are "pv" (the PV series), "forecast" (the Open-Meteo
+# previous-runs archive, all eight fields from one import) and "history" (the
+# Open-Meteo weather history, obs_* fields: diagnostic, training only, removable
+# once the observed-weather ceiling is known).
 inputs:
   - name: pv
     type: float
@@ -34,6 +36,18 @@ inputs:
     type: string
   - name: lead_days
     type: int
+  - name: obs_shortwave_radiation
+    type: float
+  - name: obs_direct_radiation
+    type: float
+  - name: obs_diffuse_radiation
+    type: float
+  - name: obs_cloudcover
+    type: float
+  - name: obs_temperature_2m
+    type: float
+  - name: obs_weather_time
+    type: string
 
 # What the operator emits, stamped with the hour the prediction is about.
 outputs:
