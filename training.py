@@ -1,22 +1,28 @@
 """Training, on Ray.
 
-A day-ahead PV forecast from archived numerical weather forecasts.
+A day-ahead PV forecast from archived numerical weather forecasts and the
+inverter's own output a day earlier.
 
 Inputs (one dataset per input topic, in topic order):
   * the PV series, mapped to "pv" (W, instantaneous)
   * the Open-Meteo previous-runs forecast archive, one row per forecast hour and
     lead day, mapped to FORECAST_FIELDS + "forecasted_for" + "lead_days"
   * optional, diagnostic only: the Open-Meteo weather history, mapped to
-    OBS_ARGS. It never reaches the registered model; it feeds one metric,
-    holdout_mae_observed_weather, which is the error the same model reaches when
-    it is given the weather as it turned out instead of as it was forecast a day
-    earlier. That bounds what any day-ahead forecast of this site can achieve
-    with this model and these weather variables.
+    OBS_ARGS. It never reaches the registered model; it feeds
+    holdout_mae_observed_weather, the error a weather-only model reaches on the
+    weather as it turned out.
 
 The target is the PV series' hourly mean, bucketed exactly as Operator Lib's
 evaluation buckets it: the arithmetic mean of the samples whose time falls in
-[hour, hour + 1h). Each training row joins one such bucket B with the forecasts
-issued LEAD_DAYS before it for B and for B + 1h.
+[hour, hour + 1h). Each training row joins one such bucket B with
+  * the forecasts issued LEAD_DAYS before it for B and for B + 1h, and
+  * pv_lag24h, the PV hourly mean of B - 24h. The operator predicts B when the
+    forecast for B + 1h arrives, at about B - 23h, when that bucket is complete.
+
+Run 5 (experiment ees26ce6srvjx5zd3wkeomgy54) put a weather-only model on the
+weather as it turned out at 37.6 W holdout MAE against 45.0 W on the day-ahead
+forecast: most of the error is not forecast error. pv_lag24h carries what the
+weather cannot: an outage, a frozen reading, seasonal shading.
 """
 
 import datetime
@@ -68,6 +74,8 @@ FORECAST_FIELDS = [
 NEXT_FIELDS = [f"{field}_next" for field in FORECAST_FIELDS]
 FORECAST_ARGS = FORECAST_FIELDS + ["forecasted_for", "lead_days"]
 PV_ARG = "pv"
+LAG_FIELD = "pv_lag24h"
+LAG = pd.Timedelta(hours=24)
 
 # The diagnostic weather-history input. Prefixed so the names never collide with
 # the forecast's own.
@@ -81,12 +89,9 @@ OBS_FIELDS = [
 OBS_TIME = "obs_weather_time"
 OBS_ARGS = OBS_FIELDS + [OBS_TIME]
 
-# Run 4 (experiment fuuuqazsves2j4ir7d6re43kny) read weather_time as UTC and
-# found the error falling monotonically to the edge of the -2..+2 h search
-# (best +2 h in an August holdout), which is what local German summer time read
-# as UTC looks like. weather_time is therefore read as Europe/Berlin local time
-# when it carries no offset, and the only shift left to search is the hour
-# labelling convention: 0 = labelled by its start, 1 = labelled by its end.
+# Run 4 read weather_time as UTC and found the best alignment at the edge of the
+# search; run 5 confirmed it is Europe/Berlin local time with hours labelled by
+# their start (shift 0: 37.6 W, shift 1: 38.2 W).
 OBS_TIMEZONE = os.environ.get("PV_OBS_TIMEZONE", "Europe/Berlin")
 OBS_SHIFTS_H = (0, 1)
 
@@ -141,8 +146,8 @@ def build_features(frame: pd.DataFrame, lat: float, lon: float) -> pd.DataFrame:
 
     `frame` carries a UTC "bucket" column (the hour the row predicts, which is
     also the forecasted_for of the current-hour forecast), FORECAST_FIELDS for
-    that hour and NEXT_FIELDS for the hour after. A missing next hour is NaN,
-    which the regressor handles natively.
+    that hour, NEXT_FIELDS for the hour after and, where known, LAG_FIELD. A
+    missing value is NaN, which the regressor handles natively.
     """
     bucket = pd.DatetimeIndex(frame["bucket"])
     values = frame[FORECAST_FIELDS + NEXT_FIELDS].astype(float).set_axis(bucket)
@@ -152,11 +157,15 @@ def build_features(frame: pd.DataFrame, lat: float, lon: float) -> pd.DataFrame:
     features["shortwave_mean2"] = (
         features[["shortwave_radiation", "shortwave_radiation_next"]].mean(axis=1)
     )
+    if LAG_FIELD in frame.columns:
+        features[LAG_FIELD] = pd.to_numeric(frame[LAG_FIELD], errors="coerce").to_numpy(dtype=float)
+    else:
+        features[LAG_FIELD] = np.nan
     return features
 
 
 FEATURE_COLUMNS = FORECAST_FIELDS + NEXT_FIELDS + GEOMETRY_COLUMNS + [
-    "beam_on_horizontal", "shortwave_mean2",
+    "beam_on_horizontal", "shortwave_mean2", LAG_FIELD,
 ]
 
 
@@ -176,7 +185,6 @@ def _parse_local_to_utc(values, zone: str) -> typing.Tuple[pd.Series, bool]:
     if pd.api.types.is_datetime64tz_dtype(raw):
         return raw.dt.tz_convert("UTC"), False
     if not pd.api.types.is_datetime64_any_dtype(raw):
-        # Mixed offsets come back as objects; parse them as the instants they name.
         return _parse_utc(values), False
     local = raw.dt.tz_localize(zone, ambiguous="NaT", nonexistent="NaT")
     return local.dt.tz_convert("UTC"), True
@@ -187,12 +195,12 @@ def _parse_local_to_utc(values, zone: str) -> typing.Tuple[pd.Series, bool]:
 # --------------------------------------------------------------------------- #
 
 class OdeAblationPvL2Model(PythonModel):
-    """Maps the forecasts for hour B and B + 1h to a PV prediction for hour B.
+    """Maps the forecasts for hour B and B + 1h, and PV at B - 24h, to a prediction for B.
 
     predict() takes a dict with "bucket" (the hour predicted, ISO 8601 or a
-    datetime), FORECAST_FIELDS for that hour and NEXT_FIELDS for the hour after.
-    It returns {"time": ISO bucket start, "prediction": W}, or None when the
-    bucket cannot be parsed.
+    datetime), FORECAST_FIELDS for that hour, NEXT_FIELDS for the hour after and
+    LAG_FIELD (None when unknown). It returns {"time": ISO bucket start,
+    "prediction": W}, or None when the bucket cannot be parsed.
     """
 
     def __init__(self, regressor, lead_days: int, lat: float, lon: float, upper: float) -> None:
@@ -208,7 +216,7 @@ class OdeAblationPvL2Model(PythonModel):
         if pd.isna(bucket):
             return None
         row = {"bucket": [bucket]}
-        for field in FORECAST_FIELDS + NEXT_FIELDS:
+        for field in FORECAST_FIELDS + NEXT_FIELDS + [LAG_FIELD]:
             value = payload.get(field)
             row[field] = [np.nan if value is None else float(value)]
         features = build_features(pd.DataFrame(row), self.lat, self.lon)
@@ -278,7 +286,11 @@ def _with_next(by_hour: pd.DataFrame) -> pd.DataFrame:
 
 
 def _dataset(target: pd.Series, by_hour: pd.DataFrame) -> pd.DataFrame:
-    features = build_features(_with_next(by_hour).reset_index(), LAT, LON)
+    paired = _with_next(by_hour)
+    lag = target.copy()
+    lag.index = lag.index + LAG
+    paired[LAG_FIELD] = lag.reindex(paired.index).to_numpy()
+    features = build_features(paired.reset_index(), LAT, LON)
     features = features[~features.index.duplicated(keep="last")]
     joined = features.join(target.rename("target"), how="inner")
     return joined.dropna(subset=["target"]).sort_index()
@@ -307,11 +319,9 @@ def _holdout_mae(data: pd.DataFrame, columns: typing.List[str], cut) -> typing.T
 
 def _observed_ceiling(observed: pd.DataFrame, target: pd.Series, holdout_index: pd.DatetimeIndex,
                       cut) -> typing.Dict[str, float]:
-    """The same model on the weather as it turned out, on exactly the same holdout hours.
+    """A weather-only model on the weather as it turned out, on the same holdout hours.
 
-    weather_time is read as OBS_TIMEZONE local time when it carries no offset;
-    only the hour-labelling convention (OBS_SHIFTS_H) is then searched — a time
-    alignment, never a feature, so it stays a fair bound.
+    Deliberately without pv_lag24h, so it stays comparable with runs 4 and 5.
     """
     frame = observed.copy()
     hours, localized = _parse_local_to_utc(frame[OBS_TIME], OBS_TIMEZONE)
@@ -337,7 +347,6 @@ def _observed_ceiling(observed: pd.DataFrame, target: pd.Series, holdout_index: 
         features = pd.concat([paired, geometry], axis=1)
         data = features.join(target.rename("target"), how="inner").dropna(subset=["target"])
         columns = list(paired.columns) + GEOMETRY_COLUMNS
-        # Score on the forecast model's own holdout hours so the two are comparable.
         hold_part = data[data.index.isin(holdout_index)]
         train_part = data[data.index <= cut]
         data = pd.concat([train_part, hold_part])
@@ -369,6 +378,8 @@ def _fit(datasets: typing.List[typing.Any]) -> typing.Dict[str, typing.Any]:
         "train_rows": int(len(data)),
         "next_hour_missing_ratio": float(data["shortwave_radiation_next"].isna().mean())
         if len(data) else float("nan"),
+        "pv_lag24h_missing_ratio": float(data[LAG_FIELD].isna().mean())
+        if len(data) else float("nan"),
     }
     if len(data) < 200:
         raise RuntimeError(f"too few aligned rows to train on: {report}")
@@ -379,6 +390,10 @@ def _fit(datasets: typing.List[typing.Any]) -> typing.Dict[str, typing.Any]:
     report["holdout_mae_daylight"] = mae_day
     report["holdout_buckets"] = n
     report["holdout_target_mean"] = float(data[data.index > cut]["target"].mean())
+
+    # The same model without the lag, on the same split: what pv_lag24h added.
+    no_lag = [c for c in FEATURE_COLUMNS if c != LAG_FIELD]
+    report["holdout_mae_without_lag"], _, _ = _holdout_mae(data, no_lag, cut)
 
     if observed is not None:
         holdout_index = data.index[data.index > cut]
@@ -406,7 +421,7 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         "training_window_days": TRAINING_WINDOW.days,
         "lead_days": LEAD_DAYS,
         "holdout_days": HOLDOUT.days,
-        "features": "current+next hour forecast",
+        "features": "current+next hour forecast, pv_lag24h",
         "train_from": report["train_from"],
         "train_to": report["train_to"],
         "lat": LAT,

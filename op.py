@@ -1,8 +1,9 @@
 """The operator: a day-ahead PV forecast from archived weather forecasts.
 
 Inputs that reach infer():
-  * "pv": the PV series itself. It is an input so the model can train on it and
-    so the evaluation can score against it; infer() answers nothing for it.
+  * "pv": the PV series itself. infer() keeps hourly sums of it, so that the
+    hourly mean of the hour a day before the one being predicted is at hand
+    (pv_lag24h), and answers nothing for it.
   * "forecast": the Open-Meteo previous-runs archive. Every message is one
     forecast hour at one lead time, published at its issue time.
   * "history" (diagnostic, training only): the Open-Meteo weather history. It
@@ -10,10 +11,14 @@ Inputs that reach infer():
     can be dropped from the pipeline once that question is answered.
 
 The model predicts hour B from the forecasts for B and B + 1h at the trained lead
-time. The forecast for B + 1h is issued an hour after the one for B, so infer()
-keeps the forecasts it has seen by hour and answers for B when B + 1h arrives:
-still about 23 h ahead at lead 1. The result is stamped with B, the hour it is
-about, not the hour it was made.
+time and from PV at B - 24h. The forecast for B + 1h is issued an hour after the
+one for B, so infer() keeps the forecasts it has seen by hour and answers for B
+when B + 1h arrives: about 23 h ahead at lead 1, when the hour B - 24h is
+complete. The result is stamped with B, the hour it is about.
+
+pv_lag24h is held in memory, so it is unknown for the first day after the
+operator starts (and for the first day of an evaluation replay); the model was
+trained with missing lags and handles that.
 """
 
 import datetime
@@ -25,9 +30,13 @@ from mlflow.pyfunc import PyFuncModel, PythonModel
 from operator_lib.util import Config, MLOperator, Selector
 from operator_lib.util.helpers import TrainMlflowLogger
 
-from training import FORECAST_ARGS, FORECAST_FIELDS, LEAD_DAYS, OBS_ARGS, PV_ARG, train_model
+from training import (
+    FORECAST_ARGS, FORECAST_FIELDS, LAG_FIELD, LEAD_DAYS, OBS_ARGS, PV_ARG, train_model,
+)
 
 HOUR = datetime.timedelta(hours=1)
+LAG = datetime.timedelta(hours=24)
+PV_KEEP = datetime.timedelta(hours=48)
 
 
 class CustomConfig(Config):
@@ -51,6 +60,13 @@ def _utc(value) -> typing.Optional[datetime.datetime]:
     return parsed.to_pydatetime()
 
 
+def _floor_hour(at: datetime.datetime) -> datetime.datetime:
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=datetime.timezone.utc)
+    at = at.astimezone(datetime.timezone.utc)
+    return at.replace(minute=0, second=0, microsecond=0)
+
+
 class Operator(MLOperator):
     configType = CustomConfig
 
@@ -65,7 +81,29 @@ class Operator(MLOperator):
         # test window before it returns.
         self.trained_at: typing.Optional[datetime.datetime] = None
         self.pending: typing.Dict[datetime.datetime, typing.Dict[str, typing.Any]] = {}
+        self.pv_hours: typing.Dict[datetime.datetime, typing.List[float]] = {}
         super().init(*args, **kwargs)
+
+    def _record_pv(self, data: typing.Dict[str, typing.Any], timestamp: datetime.datetime) -> None:
+        value = data.get(PV_ARG)
+        if value is None or isinstance(value, bool):
+            return
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return
+        bucket = _floor_hour(timestamp)
+        acc = self.pv_hours.setdefault(bucket, [0.0, 0])
+        acc[0] += value
+        acc[1] += 1
+        for stale in [h for h in self.pv_hours if h < bucket - PV_KEEP]:
+            del self.pv_hours[stale]
+
+    def _pv_mean(self, bucket: datetime.datetime) -> typing.Optional[float]:
+        acc = self.pv_hours.get(bucket)
+        if not acc or acc[1] == 0:
+            return None
+        return acc[0] / acc[1]
 
     def infer(
         self,
@@ -77,6 +115,9 @@ class Operator(MLOperator):
     ) -> typing.Tuple[
         typing.Optional[datetime.datetime], typing.Optional[typing.Any], typing.Optional[PythonModel]
     ]:
+        if selector == "pv":
+            self._record_pv(data, timestamp)
+            return None, None, None
         if selector != "forecast" or model is None:
             return None, None, None
         try:
@@ -101,6 +142,7 @@ class Operator(MLOperator):
         payload = {"bucket": bucket.isoformat(), **current}
         for field in FORECAST_FIELDS:
             payload[f"{field}_next"] = data.get(field)
+        payload[LAG_FIELD] = self._pv_mean(bucket - LAG)
         out = model.predict(payload)
         if not out:
             return None, None, None
