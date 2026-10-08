@@ -1,24 +1,30 @@
-"""The operator: a day-ahead PV forecast, one prediction per archived weather forecast.
+"""The operator: a day-ahead PV forecast from archived weather forecasts.
 
 Two inputs reach infer():
   * "pv": the PV series itself. It is an input so the model can train on it and
     so the evaluation can score against it; infer() answers nothing for it.
   * "forecast": the Open-Meteo previous-runs archive. Every message is one
-    forecast hour at one lead time, published at its issue time. For the lead
-    time the model was trained on, infer() predicts the PV hourly mean for the
-    hour that forecast describes and stamps the result with that hour, so the
-    output carries the time it is about rather than the time it was made.
+    forecast hour at one lead time, published at its issue time.
+
+The model predicts hour B from the forecasts for B and B + 1h at the trained lead
+time. The forecast for B + 1h is issued an hour after the one for B, so infer()
+keeps the forecasts it has seen by hour and answers for B when B + 1h arrives:
+still about 23 h ahead at lead 1. The result is stamped with B, the hour it is
+about, not the hour it was made.
 """
 
 import datetime
 import typing
 
+import pandas as pd
 from mlflow.pyfunc import PyFuncModel, PythonModel
 
 from operator_lib.util import Config, MLOperator, Selector
 from operator_lib.util.helpers import TrainMlflowLogger
 
-from training import FORECAST_ARGS, PV_ARG, train_model
+from training import FORECAST_ARGS, FORECAST_FIELDS, LEAD_DAYS, PV_ARG, train_model
+
+HOUR = datetime.timedelta(hours=1)
 
 
 class CustomConfig(Config):
@@ -26,6 +32,20 @@ class CustomConfig(Config):
 
     # Retrain at most this often, in seconds.
     retrain_after_s = 86400
+
+
+def _lead_of(model: PyFuncModel) -> int:
+    try:
+        return int(model.unwrap_python_model().lead_days)
+    except Exception:
+        return LEAD_DAYS
+
+
+def _utc(value) -> typing.Optional[datetime.datetime]:
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    if parsed is None or pd.isna(parsed):
+        return None
+    return parsed.to_pydatetime()
 
 
 class Operator(MLOperator):
@@ -40,6 +60,7 @@ class Operator(MLOperator):
         # State first: under a data split, super().init() trains and replays the
         # test window before it returns.
         self.trained_at: typing.Optional[datetime.datetime] = None
+        self.pending: typing.Dict[datetime.datetime, typing.Dict[str, typing.Any]] = {}
         super().init(*args, **kwargs)
 
     def infer(
@@ -54,11 +75,31 @@ class Operator(MLOperator):
     ]:
         if selector != "forecast" or model is None:
             return None, None, None
-
-        out = model.predict(data)
-        if not out:
+        try:
+            if int(data.get("lead_days")) != _lead_of(model):
+                return None, None, None
+        except (TypeError, ValueError):
+            return None, None, None
+        hour = _utc(data.get("forecasted_for"))
+        if hour is None:
             return None, None, None
 
+        self.pending[hour] = {field: data.get(field) for field in FORECAST_FIELDS}
+        # Two hours of forecasts are all a prediction needs.
+        for stale in [h for h in self.pending if h < hour - 2 * HOUR]:
+            del self.pending[stale]
+
+        bucket = hour - HOUR
+        current = self.pending.get(bucket)
+        if current is None:
+            return None, None, None
+
+        payload = {"bucket": bucket.isoformat(), **current}
+        for field in FORECAST_FIELDS:
+            payload[f"{field}_next"] = data.get(field)
+        out = model.predict(payload)
+        if not out:
+            return None, None, None
         about = datetime.datetime.fromisoformat(out["time"])
         if about.tzinfo is None:
             about = about.replace(tzinfo=datetime.timezone.utc)

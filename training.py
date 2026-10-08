@@ -9,14 +9,11 @@ Inputs (one dataset per input topic, in topic order):
 
 The target is the PV series' hourly mean, bucketed exactly as Operator Lib's
 evaluation buckets it: the arithmetic mean of the samples whose time falls in
-[hour, hour + 1h). Each training row joins one such bucket with the forecast that
-was issued LEAD_DAYS before it, so the model only ever learns from what would have
-been known a day ahead.
-
-Open-Meteo labels an hourly radiation value with the end of the hour it averages
-over, so the forecast stamped F most likely describes the bucket starting F - 1h.
-That is a convention, not something verified here, so training tries both
-alignments on a held-out tail and keeps the better one. The choice is logged.
+[hour, hour + 1h). Each training row joins one such bucket B with the forecasts
+issued LEAD_DAYS before it for two hours: the one stamped B and the one stamped
+B + 1h. Run 1 (commit 865f481) found the two single-hour alignments nearly tied
+(holdout MAE 47.3 vs 47.8 W), so the model now gets both and weighs them itself;
+that also absorbs a cloud the forecast places an hour early or late.
 """
 
 import datetime
@@ -40,7 +37,7 @@ TRAINING_WINDOW = datetime.timedelta(days=int(os.environ.get("PV_TRAINING_DAYS",
 # The forecast horizon the operator answers with: 1 is "issued 24 h before".
 LEAD_DAYS = int(os.environ.get("PV_LEAD_DAYS", "1"))
 
-# The held-out tail used to choose the alignment and report a validation error.
+# The held-out tail used to report a validation error before the final fit.
 HOLDOUT = datetime.timedelta(days=int(os.environ.get("PV_HOLDOUT_DAYS", "30")))
 
 # Site of the forecast archive (the import is configured for 51.7 / 10).
@@ -55,6 +52,7 @@ FORECAST_FIELDS = [
     "cloud_cover",
     "temperature_2m",
 ]
+NEXT_FIELDS = [f"{field}_next" for field in FORECAST_FIELDS]
 FORECAST_ARGS = FORECAST_FIELDS + ["forecasted_for", "lead_days"]
 PV_ARG = "pv"
 
@@ -101,25 +99,28 @@ def _solar_geometry(bucket_start: pd.DatetimeIndex, lat: float, lon: float) -> p
     )
 
 
-def build_features(forecast: pd.DataFrame, shift_h: int, lat: float, lon: float) -> pd.DataFrame:
+def build_features(frame: pd.DataFrame, lat: float, lon: float) -> pd.DataFrame:
     """One feature row per target bucket.
 
-    `forecast` carries FORECAST_FIELDS and a UTC "forecasted_for" column. The
-    bucket a row describes is forecasted_for - shift_h hours.
+    `frame` carries a UTC "bucket" column (the hour the row predicts, which is
+    also the forecasted_for of the current-hour forecast), FORECAST_FIELDS for
+    that hour and NEXT_FIELDS for the hour after. A missing next hour is NaN,
+    which the regressor handles natively.
     """
-    bucket = pd.DatetimeIndex(forecast["forecasted_for"]) - pd.Timedelta(hours=shift_h)
-    values = forecast[FORECAST_FIELDS].astype(float).set_axis(bucket)
+    bucket = pd.DatetimeIndex(frame["bucket"])
+    values = frame[FORECAST_FIELDS + NEXT_FIELDS].astype(float).set_axis(bucket)
     geometry = _solar_geometry(bucket, lat, lon)
     features = pd.concat([values, geometry], axis=1)
-    # Irradiance projected on the sun's position: a cheap clear-sky-like term
-    # trees otherwise have to assemble from two splits.
     features["beam_on_horizontal"] = features["direct_normal_irradiance"] * features["cos_zenith"]
+    features["shortwave_mean2"] = (
+        features[["shortwave_radiation", "shortwave_radiation_next"]].mean(axis=1)
+    )
     return features
 
 
-FEATURE_COLUMNS = FORECAST_FIELDS + [
+FEATURE_COLUMNS = FORECAST_FIELDS + NEXT_FIELDS + [
     "cos_zenith", "elevation", "azimuth_sin", "azimuth_cos", "doy_sin", "doy_cos",
-    "beam_on_horizontal",
+    "beam_on_horizontal", "shortwave_mean2",
 ]
 
 
@@ -132,17 +133,16 @@ def _parse_utc(values) -> pd.Series:
 # --------------------------------------------------------------------------- #
 
 class OdeAblationPvL2Model(PythonModel):
-    """Maps one archived forecast message to a PV prediction for the hour it covers.
+    """Maps the forecasts for hour B and B + 1h to a PV prediction for hour B.
 
-    predict() receives exactly the dict infer() gets for the forecast selector and
-    returns None, for a message at another lead time or with missing values, or a
-    dict with the bucket start ("time", ISO 8601 UTC) and the prediction in W.
+    predict() takes a dict with "bucket" (the hour predicted, ISO 8601 or a
+    datetime), FORECAST_FIELDS for that hour and NEXT_FIELDS for the hour after.
+    It returns {"time": ISO bucket start, "prediction": W}, or None when the
+    bucket cannot be parsed.
     """
 
-    def __init__(self, regressor, shift_h: int, lead_days: int, lat: float, lon: float,
-                 upper: float) -> None:
+    def __init__(self, regressor, lead_days: int, lat: float, lon: float, upper: float) -> None:
         self.regressor = regressor
-        self.shift_h = shift_h
         self.lead_days = lead_days
         self.lat = lat
         self.lon = lon
@@ -150,19 +150,14 @@ class OdeAblationPvL2Model(PythonModel):
 
     def predict(self, context, model_input=None, params=None):
         payload = model_input if model_input is not None else context
-        try:
-            if int(payload.get("lead_days")) != self.lead_days:
-                return None
-        except (TypeError, ValueError):
+        bucket = _parse_utc([payload.get("bucket")]).iloc[0]
+        if pd.isna(bucket):
             return None
-        forecasted_for = _parse_utc([payload.get("forecasted_for")]).iloc[0]
-        if pd.isna(forecasted_for):
-            return None
-        row = {"forecasted_for": [forecasted_for]}
-        for field in FORECAST_FIELDS:
+        row = {"bucket": [bucket]}
+        for field in FORECAST_FIELDS + NEXT_FIELDS:
             value = payload.get(field)
             row[field] = [np.nan if value is None else float(value)]
-        features = build_features(pd.DataFrame(row), self.shift_h, self.lat, self.lon)
+        features = build_features(pd.DataFrame(row), self.lat, self.lon)
         value = float(self.regressor.predict(features[FEATURE_COLUMNS].to_numpy())[0])
         value = min(max(value, 0.0), self.upper)
         return {"time": features.index[0].isoformat(), "prediction": value}
@@ -203,7 +198,8 @@ def _hourly_target(pv: pd.DataFrame) -> pd.Series:
     return frame.groupby("bucket")["pv"].mean()
 
 
-def _forecast_rows(forecast: pd.DataFrame, lead_days: int) -> pd.DataFrame:
+def _forecast_by_hour(forecast: pd.DataFrame, lead_days: int) -> pd.DataFrame:
+    """FORECAST_FIELDS at one lead time, indexed by forecasted_for, one row per hour."""
     frame = forecast.copy()
     frame["lead_days"] = pd.to_numeric(frame["lead_days"], errors="coerce")
     frame = frame[frame["lead_days"] == lead_days]
@@ -211,17 +207,25 @@ def _forecast_rows(forecast: pd.DataFrame, lead_days: int) -> pd.DataFrame:
     frame = frame.dropna(subset=["forecasted_for"])
     if "time" in frame.columns:
         frame = frame.sort_values("time", kind="stable")
-    # One forecast per hour: the latest issue of this lead time wins.
     frame = frame.drop_duplicates(subset=["forecasted_for"], keep="last")
-    return frame
+    return frame.set_index("forecasted_for")[FORECAST_FIELDS].astype(float).sort_index()
 
 
-def _dataset(target: pd.Series, forecast: pd.DataFrame, shift_h: int) -> pd.DataFrame:
-    features = build_features(forecast, shift_h, LAT, LON)
+def _pairs(by_hour: pd.DataFrame) -> pd.DataFrame:
+    """Each hour B with its own forecast and the forecast for B + 1h."""
+    nxt = by_hour.copy()
+    nxt.index = nxt.index - HOUR
+    nxt.columns = NEXT_FIELDS
+    joined = by_hour.join(nxt, how="left")
+    joined.index.name = "bucket"
+    return joined.reset_index()
+
+
+def _dataset(target: pd.Series, pairs: pd.DataFrame) -> pd.DataFrame:
+    features = build_features(pairs, LAT, LON)
     features = features[~features.index.duplicated(keep="last")]
     joined = features.join(target.rename("target"), how="inner")
-    joined = joined.dropna(subset=["target"])
-    return joined.sort_index()
+    return joined.dropna(subset=["target"]).sort_index()
 
 
 def _regressor():
@@ -244,51 +248,40 @@ def _mae(a: np.ndarray, b: np.ndarray) -> float:
 
 @ray.remote
 def _fit(datasets: typing.List[typing.Any]) -> typing.Dict[str, typing.Any]:
-    """The distributed part: read, align, choose the alignment, fit."""
+    """The distributed part: read, align, validate on the tail, fit on everything."""
     frames = [_to_pandas(d) for d in datasets]
     pv, forecast = _split_inputs(frames)
     target = _hourly_target(pv)
-    rows = _forecast_rows(forecast, LEAD_DAYS)
+    by_hour = _forecast_by_hour(forecast, LEAD_DAYS)
+    data = _dataset(target, _pairs(by_hour))
 
     report: typing.Dict[str, typing.Any] = {
         "pv_samples": int(len(pv)),
         "target_buckets": int(len(target)),
-        "forecast_rows_at_lead": int(len(rows)),
+        "forecast_rows_at_lead": int(len(by_hour)),
+        "train_rows": int(len(data)),
+        "next_hour_missing_ratio": float(data["shortwave_radiation_next"].isna().mean())
+        if len(data) else float("nan"),
     }
-
-    best = None
-    for shift_h in (1, 0):
-        data = _dataset(target, rows, shift_h)
-        if len(data) < 200:
-            report[f"shift{shift_h}_rows"] = int(len(data))
-            continue
-        cut = data.index.max() - HOLDOUT
-        train, hold = data[data.index <= cut], data[data.index > cut]
-        model = _regressor().fit(train[FEATURE_COLUMNS].to_numpy(), train["target"].to_numpy())
-        pred = np.clip(model.predict(hold[FEATURE_COLUMNS].to_numpy()), 0.0, None)
-        mae = _mae(pred, hold["target"].to_numpy())
-        report[f"shift{shift_h}_rows"] = int(len(data))
-        report[f"shift{shift_h}_holdout_mae"] = mae
-        if best is None or mae < best[1]:
-            best = (shift_h, mae, data, hold, pred)
-
-    if best is None:
+    if len(data) < 200:
         raise RuntimeError(f"too few aligned rows to train on: {report}")
 
-    shift_h, holdout_mae, data, hold, pred = best
-    report["shift_h"] = shift_h
-    report["holdout_mae"] = holdout_mae
-    report["holdout_buckets"] = int(len(hold))
+    cut = data.index.max() - HOLDOUT
+    train, hold = data[data.index <= cut], data[data.index > cut]
+    model = _regressor().fit(train[FEATURE_COLUMNS].to_numpy(), train["target"].to_numpy())
+    pred = np.clip(model.predict(hold[FEATURE_COLUMNS].to_numpy()), 0.0, None)
+    actual = hold["target"].to_numpy()
     daylight = hold["cos_zenith"].to_numpy() > 0
-    report["holdout_mae_daylight"] = _mae(pred[daylight], hold["target"].to_numpy()[daylight])
+    report["holdout_mae"] = _mae(pred, actual)
+    report["holdout_mae_daylight"] = _mae(pred[daylight], actual[daylight])
+    report["holdout_buckets"] = int(len(hold))
     report["holdout_target_mean"] = float(hold["target"].mean())
 
     final = _regressor().fit(data[FEATURE_COLUMNS].to_numpy(), data["target"].to_numpy())
     upper = float(np.nanpercentile(data["target"].to_numpy(), 99.9)) * 1.2
-    report["train_rows"] = int(len(data))
     report["train_from"] = data.index.min().isoformat()
     report["train_to"] = data.index.max().isoformat()
-    return {"regressor": final, "shift_h": shift_h, "upper": upper, "report": report}
+    return {"regressor": final, "upper": upper, "report": report}
 
 
 def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
@@ -306,7 +299,7 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         "training_window_days": TRAINING_WINDOW.days,
         "lead_days": LEAD_DAYS,
         "holdout_days": HOLDOUT.days,
-        "shift_h": report["shift_h"],
+        "features": "current+next hour forecast",
         "train_from": report["train_from"],
         "train_to": report["train_to"],
         "lat": LAT,
@@ -318,7 +311,6 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
     })
     return OdeAblationPvL2Model(
         regressor=fitted["regressor"],
-        shift_h=fitted["shift_h"],
         lead_days=LEAD_DAYS,
         lat=LAT,
         lon=LON,
